@@ -1,0 +1,23 @@
+# Build output
+doconv
+/dist/
+
+# Test artifacts
+*.pdf
+*.epub
+*.docx
+*.html
+!README.md
+
+# Go toolchain
+*.test
+*.out
+/vendor/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -5,11 +5,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	maroto "github.com/johnfercher/maroto/v2"
-	marototext "github.com/johnfercher/maroto/v2/pkg/components/text"
 	marotorow "github.com/johnfercher/maroto/v2/pkg/components/row"
+	marototext "github.com/johnfercher/maroto/v2/pkg/components/text"
 	"github.com/johnfercher/maroto/v2/pkg/config"
 	"github.com/johnfercher/maroto/v2/pkg/consts/align"
 	"github.com/johnfercher/maroto/v2/pkg/consts/fontstyle"
@@ -24,17 +25,30 @@ func init() {
 	Register("md", "pdf", ConverterFunc(mdToPDF))
 }
 
-// headingProps maps AST heading level (1–6) to maroto text props.
-func headingProps(level int) props.Text {
-	sizes := []float64{18, 15, 13, 12, 11, 10}
-	sz := sizes[0]
-	if level >= 1 && level <= 6 {
-		sz = sizes[level-1]
+// mdToPDF converts Markdown to PDF by routing through the HTML pipeline:
+//
+//	md → HTML (goldmark, full fidelity) → PDF (Chrome if available, else fallback)
+//
+// This ensures tables, code blocks, inline formatting, and all GFM features
+// are rendered correctly. The direct maroto path (mdToPDFDirect) is kept as
+// the base renderer for the pure-Go fallback chain inside html2pdf.go.
+func mdToPDF(ctx context.Context, src io.Reader, dst io.Writer) error {
+	var htmlBuf bytes.Buffer
+	if err := mdToHTML(ctx, src, &htmlBuf); err != nil {
+		return fmt.Errorf("md→html: %w", err)
 	}
-	return props.Text{Size: sz, Style: fontstyle.Bold, Align: align.Left}
+	return htmlToPDF(ctx, &htmlBuf, dst)
 }
 
-func mdToPDF(_ context.Context, src io.Reader, dst io.Writer) error {
+// ── Pure-Go fallback renderer (used by html2pdf.go when Chrome is absent) ──────
+
+// mdToPDFDirect converts Markdown to PDF using a pure-Go maroto layout engine.
+// It is not registered as a public converter; it is called by the html→pdf
+// fallback chain to avoid a circular call through mdToPDF.
+//
+// Quality is limited: inline formatting and tables are rendered as plain text,
+// but the output is readable and requires no external binaries.
+func mdToPDFDirect(ctx context.Context, src io.Reader, dst io.Writer) error {
 	input, err := io.ReadAll(src)
 	if err != nil {
 		return fmt.Errorf("read markdown: %w", err)
@@ -55,23 +69,36 @@ func mdToPDF(_ context.Context, src io.Reader, dst io.Writer) error {
 		switch node := n.(type) {
 		case *ast.Heading:
 			content := extractText(node, input)
-			rows = append(rows, marotorow.New(10).Add(marototext.NewCol(12, content, headingProps(node.Level))))
+			rows = append(rows, marotorow.New(10).Add(
+				marototext.NewCol(12, content, headingProps(node.Level)),
+			))
 			return ast.WalkSkipChildren, nil
 		case *ast.Paragraph:
 			content := extractText(node, input)
-			rows = append(rows, marotorow.New(8).Add(marototext.NewCol(12, content, props.Text{Size: 10, Align: align.Left})))
+			if strings.TrimSpace(content) == "" {
+				return ast.WalkSkipChildren, nil
+			}
+			rows = append(rows, marotorow.New(8).Add(
+				marototext.NewCol(12, content, props.Text{Size: 10, Align: align.Left}),
+			))
 			return ast.WalkSkipChildren, nil
 		case *ast.CodeBlock, *ast.FencedCodeBlock:
 			content := extractText(node, input)
-			rows = append(rows, marotorow.New(8).Add(marototext.NewCol(12, content, props.Text{Size: 9, Style: fontstyle.Italic, Align: align.Left})))
+			rows = append(rows, marotorow.New(8).Add(
+				marototext.NewCol(12, content, props.Text{Size: 9, Style: fontstyle.Italic, Align: align.Left}),
+			))
 			return ast.WalkSkipChildren, nil
 		case *ast.Blockquote:
 			content := "> " + extractText(node, input)
-			rows = append(rows, marotorow.New(8).Add(marototext.NewCol(12, content, props.Text{Size: 10, Style: fontstyle.Italic, Align: align.Left})))
+			rows = append(rows, marotorow.New(8).Add(
+				marototext.NewCol(12, content, props.Text{Size: 10, Style: fontstyle.Italic, Align: align.Left}),
+			))
 			return ast.WalkSkipChildren, nil
 		case *ast.ListItem:
 			content := "• " + strings.TrimSpace(extractText(node, input))
-			rows = append(rows, marotorow.New(7).Add(marototext.NewCol(12, content, props.Text{Size: 10, Align: align.Left})))
+			rows = append(rows, marotorow.New(7).Add(
+				marototext.NewCol(12, content, props.Text{Size: 10, Align: align.Left}),
+			))
 			return ast.WalkSkipChildren, nil
 		}
 		return ast.WalkContinue, nil
@@ -90,14 +117,30 @@ func mdToPDF(_ context.Context, src io.Reader, dst io.Writer) error {
 	return err
 }
 
+// headingProps maps AST heading level (1–6) to maroto text props.
+func headingProps(level int) props.Text {
+	sizes := []float64{18, 15, 13, 12, 11, 10}
+	sz := sizes[0]
+	if level >= 1 && level <= 6 {
+		sz = sizes[level-1]
+	}
+	return props.Text{Size: sz, Style: fontstyle.Bold, Align: align.Left}
+}
+
 // extractText returns the plain text content of an AST node.
 // Block nodes expose source Lines; inline nodes expose a Segment.
 // Falls back to walking children for composite nodes.
+// Strips any residual markdown syntax characters.
 func extractText(n ast.Node, src []byte) string {
 	var b strings.Builder
 	extractTextInto(n, src, &b)
-	return strings.TrimRight(b.String(), "\n")
+	result := strings.TrimRight(b.String(), "\n")
+	return reMarkdownSyntax.ReplaceAllString(result, "$1")
 }
+
+// reMarkdownSyntax strips leading markdown emphasis markers so that
+// **bold**, *italic*, `code` don't leak into plain-text output.
+var reMarkdownSyntax = regexp.MustCompile(`\*{1,3}([^*]+)\*{1,3}|` + "`([^`]+)`")
 
 func extractTextInto(n ast.Node, src []byte, b *strings.Builder) {
 	// Inline text leaf (most common inline node)

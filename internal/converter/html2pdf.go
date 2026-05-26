@@ -46,12 +46,10 @@ func htmlToPDF(ctx context.Context, src io.Reader, dst io.Writer) error {
 		return htmlToPDFChrome(ctx, input, dst, path)
 	}
 
-	// Fallback: HTML → Markdown → PDF
-	var mdBuf bytes.Buffer
-	if err := htmlToMD(ctx, bytes.NewReader(input), &mdBuf); err != nil {
-		return fmt.Errorf("html→md fallback: %w", err)
-	}
-	return mdToPDF(ctx, &mdBuf, dst)
+	// Fallback: direct HTML → PDF without Chrome.
+	// Uses htmlToPDFFallback which parses the HTML tree and renders it to
+	// maroto, preserving tables, headings, code blocks, and inline formatting.
+	return htmlToPDFFallback(ctx, input, dst)
 }
 
 func htmlToPDFChrome(ctx context.Context, htmlInput []byte, dst io.Writer, chromePath string) error {
